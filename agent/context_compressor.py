@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import outbound_image_retire_count
 from agent.compression_marker import (
@@ -32,6 +32,7 @@ from agent.auxiliary_client import (
     extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
+from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.micro_compaction import MicroCompactionMixin
@@ -1160,10 +1161,6 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # full protect_last_n would recreate the nothing-compactable large-tool-output case.
 _MAX_TAIL_MESSAGE_FLOOR = 8
 
-# Skip the LLM call when the compressible middle is below this fraction of the
-# threshold (and a prior ineffectiveness strike exists); dropping alone suffices.
-# See #60451.
-_FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
 # Under pressure, demote large tool outputs even inside the protected region but
 # keep this many trailing messages verbatim.
 _PRESSURE_KEEP_RECENT_MESSAGES = 3
@@ -1701,6 +1698,10 @@ def _sum_terminal(name, args, content, content_len, line_count):
 
 
 def _sum_write_file(name, args, content, content_len, line_count):
+    # A refused write (stale-write guard, sensitive path, I/O error) changed nothing; summarized as
+    # "wrote to" it compresses into a success the post-compaction agent then reports.
+    if failed := _result_failure_suffix(content):
+        return f"[write_file] {args.get('path', '?')}{failed}"
     written_lines = _str_arg(args, "content").count("\n") + 1 if args.get("content") else "?"
     return f"[write_file] wrote to {args.get('path', '?')} ({written_lines} lines)"
 
@@ -2010,10 +2011,36 @@ def _json_dict(text: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> "str | None":
+    """Summary for a call an approval or write guard refused (``BLOCKED: ...`` / ``status``
+    ``blocked``/``pending_approval``), else None. The per-tool summarizers describe the call as done
+    ("ran ...", "wrote to ..."), which would turn a user's denial into a record of the action and
+    drop the "do not retry" instruction. Strictly below _PRUNE_MIN_CHARS, like the clarify summary,
+    so later prune passes keep it."""
+    payload = _json_dict(content)
+    status = payload.get("status")
+    error = payload.get("error") if isinstance(payload.get("error"), str) else ""
+    if not error and content.lstrip().startswith("BLOCKED"):
+        error = content.strip()
+    if status == "pending_approval":
+        outcome = "awaiting the user's approval, not run"
+    elif error and (status == "blocked" or error.lstrip().startswith("BLOCKED")):
+        outcome = "BLOCKED, not run"
+        if "NOT consented" in error:
+            outcome += "; the user did NOT consent, do not retry or reach the same outcome another way"
+    else:
+        return None
+    target = _str_arg(args, "command") or _str_arg(args, "path")
+    target = f" `{target if len(target) <= 60 else target[:57] + '...'}`" if target else ""
+    return f"[{tool_name}]{target} {outcome}"[:_PRUNE_MIN_CHARS - 1]
+
+
 def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     args = _json_dict(tool_args)
     content = tool_content or ""
+    if (refused := _summarize_refused_tool_result(tool_name, args, content)) is not None:
+        return refused
     content_len = len(content)
     line_count = content.count("\n") + 1 if content.strip() else 0
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
@@ -2147,7 +2174,7 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
-class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngine):
+class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMixin, ContextEngine):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
@@ -2368,6 +2395,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._prellm_skip_count = 0
         # Only a healthy completed summary resets this; ordinary fitting responses do not.
         self._fallback_compression_streak = 0
+        # Wall-clock time of the next summary-model probe while the fallback streak benches it; 0.0 = unarmed.
+        self._fallback_probe_at = 0.0
         # Armed at a completed boundary; consumed by the next real prompt count in update_from_response().
         self._verify_compaction_cleared_threshold = False
         # Lets the boundary wrapper tell a completed rewrite from a no-op without inferring from length.
@@ -2394,12 +2423,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = self._fallback_compression_streak = 0
         self._consecutive_overload_aborts = 0
         self._ineffective_compression_count = self._prellm_skip_count = 0
-        self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
+        self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = self._fallback_probe_at = 0.0
         self._reset_proactive_prune_rearm()
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_anti_thrash_recovery_deadline()
+        self._load_fallback_probe_at()
         self._load_consecutive_overload_aborts()
         self._load_proactive_prune_rearm_tokens()
 
@@ -2412,6 +2442,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
         previous_overload_aborts = self._consecutive_overload_aborts
+        previous_probe_at = self._fallback_probe_at
         if boundary_reason == "compression" and old_session_id:
             # Parent row carries the streak/strike state across the rotation.
             def _parent(method: str, label: str, current: int) -> int:
@@ -2431,6 +2462,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         if boundary_reason == "compression":
             # Rotation creates a fresh child row first; carry the streak until boundary bookkeeping persists it.
             self._fallback_compression_streak = previous_fallback_streak
+            # The bench probe deadline lives in the model-config blob, which the child row lacks.
+            self._set_fallback_probe_at(previous_probe_at)
             # No later bookkeeping writes the strike counter, so persist it onto the child row now (#54923).
             if self._ineffective_compression_count != previous_ineffective_count:
                 self._ineffective_compression_count = previous_ineffective_count
@@ -2582,14 +2615,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._structural_no_op_backoff_until = 0.0
         self._verify_compaction_cleared_threshold = True
         if feasibility_skip:
-            # A pre-LLM feasibility skip is not a summary-quality verdict: it must neither extend nor reset the streak.
-            # A deliberate pre-LLM feasibility skip (#60451) is not a summary-quality verdict: it must
-            # neither extend a fallback streak (two skips would otherwise latch the >= 2 breaker and disable
-            # compression entirely — including the cheap deterministic dropping the skip exists to reach)
+            # A deliberate pre-LLM summary skip (#60451, benched model) is not a summary-quality verdict: it must
+            # neither extend a fallback streak (the streak decides whether the summary model is called)
             # nor reset one (a skip proves nothing about the summary model's health).
             if not self.quiet_mode:
                 logger.info(
-                    "Compaction completed via pre-LLM feasibility skip; fallback_compression_streak unchanged (%d)",
+                    "Compaction completed via pre-LLM summary skip; fallback_compression_streak unchanged (%d)",
                     self._fallback_compression_streak,
                 )
             return
@@ -2782,8 +2813,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     _MIN_CTX_TRIGGER_RATIO = 0.85
 
     # Anti-thrash recovery: after this long blocked, allow ONE probe (counters drop to 1 strike).
-    # Anti-thrash recovery window (#14694): once the ineffective/fallback breaker trips, automatic
-    # compaction stays blocked for this long, then ONE probe attempt is allowed (counters drop to 1 strike,
+    # Anti-thrash recovery window (#14694): once the ineffective breaker trips, automatic
+    # compaction stays blocked for this long, then ONE probe attempt is allowed (the count drops to 1 strike,
     # so another ineffective pass re-trips immediately). Long enough that a genuinely incompressible session
     # isn't compacting in a loop; short enough that a session which has since grown real compressible
     # material recovers well before it rides into the provider's hard context limit.
@@ -3081,14 +3112,18 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         return "ineffective" if self._tripped() else None
 
     def _tripped(self) -> bool:
-        """Anti-thrash breaker state: two ineffective compactions or two fallback summaries in a row."""
-        return self._ineffective_compression_count >= 2 or self._fallback_compression_streak >= 2
+        """Only provider-confirmed ineffective compactions trip the breaker.
+
+        A static fallback still reclaims the window, so blocking on it lets the prompt run into the
+        provider's hard limit. The fallback streak instead benches the failing summary model
+        (``_fallback_streak_skip``), which is what stops a paid fallback loop (#63008).
+        """
+        return self._ineffective_compression_count >= 2
 
     def _refresh_durable_guards(self) -> None:
         """Re-read durable cooldown + breaker state; called only when a gate is about to block."""
         for label, refresh in (
             ("cooldown", lambda: self.get_active_compression_failure_cooldown(refresh=True)),
-            ("fallback-streak", self._load_fallback_compression_streak),
             ("ineffective-count", self._load_ineffective_compression_count),
         ):
             try:
@@ -3119,7 +3154,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     logger.debug("Compression deferred — %s for %.0fs more", what, remaining)
                 return True
         # Anti-thrash back-off must not be permanent: after _ANTI_THRASH_RECOVERY_SECONDS blocked, allow ONE
-        # probe by dropping counters to 1 strike (persisted). Deadline is armed lazily and persisted on the row.
+        # probe by dropping the ineffective count to 1 strike (persisted). Deadline is armed lazily and persisted on the row.
         if self._tripped():
             # Wall clock: the deadline is persisted so a rebuilt compressor resumes the SAME window.
             # Wall clock, not monotonic: the deadline is persisted on the session row (#100185) so a fresh
@@ -3140,7 +3175,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 # accumulate plenty of compressible material later. Without a recovery path the session
                 # never auto-compacts again and rides into the provider's hard context limit. Recovery is a
                 # probation probe: after _ANTI_THRASH_RECOVERY_SECONDS of continuous block, allow ONE
-                # attempt by dropping the tripped counter(s) to 1 strike (persisted, so sibling agents on
+                # attempt by dropping the ineffective counter to 1 strike (persisted, so sibling agents on
                 # the same session row unblock too). If the probe is ineffective again the very next verdict
                 # re-trips the guard, so the worst case in the truly-incompressible state is one compaction
                 # attempt per recovery window — bounded, not thrash. The clock is armed lazily on the first
@@ -3150,9 +3185,6 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 # already-armed deadline resumes that window instead of restarting it.
                 if self._ineffective_compression_count >= 2:
                     self._record_ineffective_compression_verdict(1)
-                if self._fallback_compression_streak >= 2:
-                    self._fallback_compression_streak = 1
-                    self._persist_fallback_compression_streak()
                 if not self.quiet_mode:
                     logger.info(
                         "Anti-thrashing recovery: %.0fs elapsed since the guard tripped — allowing one "
@@ -3185,21 +3217,25 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         ``cut_at_break``. Only the newest assistant turn's thinking is charged (#73624) unless the route
         echoes stale thinking every turn — must agree with the preflight estimate (#84371)."""
         n = len(messages)
-        newest_asst_idx = _last_assistant_index(messages)
-        charge_all_thinking = self._stale_thinking_on_wire()
-        native_budget = self._native_anthropic_budget()
+        price = self._tail_row_pricer(messages)
         accumulated = 0
         cut = n  # start from beyond the end
         for i in range(n - 1, head_end - 1, -1):
-            msg_tokens = (
-                native_budget(messages[i]) if native_budget
-                else _estimate_msg_budget_tokens(messages[i], charge_all_thinking or i == newest_asst_idx)
-            )
+            msg_tokens = price(i)
             if accumulated + msg_tokens > ceiling and (n - i) >= min_tail:
                 return (i if cut_at_break else cut), accumulated
             accumulated += msg_tokens
             cut = i
         return cut, accumulated
+
+    def _tail_row_pricer(self, messages: List[Dict[str, Any]]) -> Callable[[int], int]:
+        """Per-row tail price ``index -> tokens``: the walk's accounting, shared by every gate that sizes a tail region."""
+        newest_asst_idx = _last_assistant_index(messages)
+        charge_all_thinking = self._stale_thinking_on_wire()
+        native_budget = self._native_anthropic_budget()
+        if native_budget:
+            return lambda i: native_budget(messages[i])
+        return lambda i: _estimate_msg_budget_tokens(messages[i], charge_all_thinking or i == newest_asst_idx)
 
     def _prune_boundary(
         self, result: List[Dict[str, Any]], protect_tail_count: int, protect_tail_tokens: int | None,
@@ -3962,10 +3998,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
             # (thinking models burn it on reasoning). Timeout comes from call_llm config.
         }
-        if self.summary_model:
-            call_kwargs["model"] = self.summary_model
-        # Pinned route (stall fallback) overrides task routing so the retry leaves the stalled backend.
-        call_kwargs.update(_pinned_summary_call_kwargs())
+        # Pinned route (stall fallback) replaces task routing so the retry leaves the stalled backend.
+        self._apply_summary_route(call_kwargs, _pinned_summary_call_kwargs())
         # Compression is atomic: protect the in-flight summary call from a mid-turn gateway interrupt.
         # Without this, an incoming user message aborts the summary and compression falls back to a degraded
         # static marker, losing the real handoff (#23975). Re-entrant: a main-model retry (_generate_summary
@@ -4525,11 +4559,12 @@ Write only the summary body. Do not include any preamble or prefix."""
                 continue
             if len(text) > _ACTIVE_TASK_MAX_CHARS:
                 # Past the cap, drop a gateway reply quote first so elision cannot keep the quote
-                # and cut the request; the split-turn gate measures the same authored text.
+                # and cut the request.
                 text = _redact_compaction_text(_authored_request_text(msg.get("content"))) or text
             text = re.sub(r"\s+", " ", text)
             # Elide AFTER repr: repr would escape the marker's "Hermes's" and hide a copy from the
-            # guard. Authored text within the cap stays whole (the split-turn path relies on that).
+            # guard. Authored text within the cap stays whole; a longer request split out of an
+            # oversized turn is restated verbatim by _reappend_inflight_user_task, not by this snapshot.
             text = repr(text) if len(text) <= _ACTIVE_TASK_MAX_CHARS else elide(repr(text), _ACTIVE_TASK_MAX_CHARS)
             return (
                 f"User asked (deterministic, from compacted turns): {text}\n"
@@ -5005,6 +5040,46 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
         drop_stale_api_content(replay)
 
+        # The replay is a replacement for the in-flight row, not an additional
+        # occurrence of it. When the original survived in the protected head,
+        # retaining it gives the durable transcript two active rows with the
+        # same message_uid and renders the request twice after reload.
+        from agent.message_metadata import MESSAGE_UID, message_uid_or_none, record_absorbed_message
+
+        if replay_uid := message_uid_or_none(replay):
+            before = len(compressed)
+            kept = list(compressed)
+            compressed[:] = [
+                msg
+                for msg in compressed
+                if not (
+                    msg is not carrier
+                    and msg.get("role") == "user"
+                    and msg.get(MESSAGE_UID) == replay_uid
+                )
+            ]
+            # When the removed row opened the window, the head's tool flow
+            # (assistant tool_calls) would now lead; native Gemini rejects a
+            # leading model functionCall turn. Open the window on the carrier.
+            first = next(i for i, msg in enumerate(compressed) if msg.get("role") != "system")
+            if len(compressed) != before and compressed[first].get("role") != "user":
+                if _template_visible_role(carrier) is None:
+                    # Carrier merged into a tail assistant(tool_calls) row:
+                    # moving it would split it from its tool results. Keep
+                    # the head row this cycle (pre-dedup layout).
+                    compressed[:] = kept
+                else:
+                    compressed.insert(first, compressed.pop(compressed.index(carrier)))
+            # The summary role was picked against a head that ended on the row
+            # just removed: an assistant carrier would now open the visible
+            # sequence (or follow an assistant). Use the _force_user_leading
+            # layout instead — carrier role=user, request after its end marker.
+            if len(compressed) != before and _template_visible_role(carrier) == "assistant" and (
+                _last_template_visible_role(compressed[: compressed.index(carrier)]) != "user"
+            ):
+                carrier["role"] = "user"
+                last_visible_role = _last_template_visible_role(compressed)
+
         if last_visible_role == "user":
             # Alternation is judged on template-visible rows only (tool_calls /
             # tool rows are exempt), so a user-pinned summary followed by a
@@ -5020,8 +5095,6 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
             drop_stale_api_content(carrier)
             # The carrier absorbed a durable user turn: record its uid (merge witness).
-            from agent.message_metadata import record_absorbed_message
-
             record_absorbed_message(carrier, inflight)
             return compressed
 
@@ -5155,9 +5228,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             # A single oversized user message is indivisible and must stay verbatim in the tail; this
             # exception is only for aggregate turn growth after a normally sized opening request.
             and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
-            # Measure what the user wrote: a gateway reply pointer quotes another message and
-            # would otherwise disable the split for a short reply to a long answer.
-            and len(_authored_request_text(messages[last_user_idx].get("content"))) <= _ACTIVE_TASK_MAX_CHARS
+            # The token ceiling is the only size guard: the request is restated verbatim after the
+            # handoff, so a character cap only pinned long requests (e.g. /goal prompts) in place.
             # Only split when there is real turn body to summarize: if the oversized weight is the
             # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
             # active request out of the tail buys no reclaim and loses the #10896 anchor.
@@ -5181,7 +5253,28 @@ Write only the summary body. Do not include any preamble or prefix."""
         # An older visible assistant reply can precede the active user turn; under the split above,
         # pulling back to it would undo the bounded exception.
         if not split_oversized_turn:
-            cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+            asst_anchored_cut = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+            # The assistant anchor needs the same bound the user anchor got in #80449. In a long
+            # agentic turn whose assistant rows only carry tool_calls (no text reply yet), the
+            # newest text-bearing assistant is the PREVIOUS turn's closer: anchoring to it retains
+            # the whole oversized active turn, the middle collapses to nothing, and the session
+            # wedges in no_progress (#131412). When the anchored region holds tool-call bodies and is
+            # over the soft ceiling, keep the walk's tool-group-aligned cut instead.
+            if (
+                asst_anchored_cut < cut_idx
+                and allow_split_turn
+                and any(messages[i].get("tool_calls") for i in range(asst_anchored_cut, cut_idx))
+                # Priced like the walk (#84371): stale thinking the wire never carries must not trip it.
+                and sum(map(self._tail_row_pricer(messages), range(asst_anchored_cut, cut_idx))) > soft_ceiling
+            ):
+                if not self.quiet_mode:
+                    logger.debug(
+                        "Assistant reply anchor would retain an over-ceiling region; keeping "
+                        "tool-group-aligned cut at index %d instead of anchoring to %d (#131412)",
+                        cut_idx, asst_anchored_cut,
+                    )
+            else:
+                cut_idx = asst_anchored_cut
 
         # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
         # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
@@ -5324,32 +5417,6 @@ Write only the summary body. Do not include any preamble or prefix."""
             compress_start + 1, compress_end, n_turns, compress_start, tail_msgs,
         )
 
-    def _feasibility_skip(
-        self, telemetry: Dict[str, Any], turns_to_summarize: List[Dict[str, Any]],
-        compress_start: int, compress_end: int,
-    ) -> bool:
-        """Pre-LLM skip after a real-usage ineffectiveness strike (reads the counter, never writes)."""
-        if self._ineffective_compression_count < 1:
-            return False
-        # Reuse the telemetry estimate so log and telemetry agree; None means the regions helper
-        # no-op'd (0 is valid).
-        middle_tokens = telemetry.get("middle_window_tokens")
-        middle_tokens = estimate_messages_tokens_rough(turns_to_summarize) if middle_tokens is None else middle_tokens
-        if middle_tokens >= int(self.threshold_tokens * _FEASIBILITY_SKIP_MIDDLE_FRACTION):
-            return False
-        self._last_feasibility_skip = True
-        self._prellm_skip_count += 1
-        telemetry["prellm_skip_count"] = self._prellm_skip_count
-        if not self.quiet_mode:
-            logger.warning(
-                "Compression: middle section (%d tokens at indices %d-%d) is below %.0f%% of threshold (%d tokens) — "
-                "skipping LLM summarization, proceeding with deterministic message dropping. prellm_skip_count=%d",
-                middle_tokens, compress_start, compress_end,
-                _FEASIBILITY_SKIP_MIDDLE_FRACTION * 100,
-                self.threshold_tokens, self._prellm_skip_count,
-            )
-        return True
-
     def _abort_on_summary_failure(
         self, telemetry: Dict[str, Any], n_skipped: int, previous_summary_before_scan: Optional[str],
     ) -> bool:
@@ -5408,7 +5475,7 @@ Write only the summary body. Do not include any preamble or prefix."""
     ) -> str:
         """Deterministic fallback so the model gets recoverable continuity anchors."""
         if not self.quiet_mode and feasibility_skip:
-            logger.info("Feasibility skip — inserting deterministic fallback context summary")
+            logger.info("Pre-LLM summary skip — inserting deterministic fallback context summary")
         elif not self.quiet_mode:
             logger.warning("Summary generation failed — inserting deterministic fallback context summary")
         self._last_summary_dropped_count = n_dropped
@@ -5647,8 +5714,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.conversation_compression import _raise_if_stale_attempt
 
         _raise_if_stale_attempt(self)
-        feasibility_skip = not force and self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
-        summary = None  # feasibility skip: no LLM call; Phase 4 inserts the deterministic fallback
+        feasibility_skip = not force and (
+            self._fallback_streak_skip(telemetry)
+            or self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
+        )
+        summary = None  # pre-LLM summary skip (feasibility or benched model): no LLM call; Phase 4 inserts the deterministic fallback
         if not feasibility_skip:
             summary = self._summarize_window(
                 messages, turns_to_summarize, scan, focus_topic, memory_context, bypass_cooldown,
