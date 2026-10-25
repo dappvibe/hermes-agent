@@ -113,12 +113,9 @@ class MaxAdapter(BasePlatformAdapter):
 
     async def _run_poll(self) -> None:
         """Long-poll GET /updates with automatic reconnection."""
-        import time
         backoff_idx = 0
-        poll_start = 0.0
         while self._running:
             try:
-                poll_start = time.monotonic()
                 await self._poll_once()
                 backoff_idx = 0  # a clean round resets backoff immediately (unlike streaming)
                 continue
@@ -308,9 +305,11 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup."""
+    from .dashboard_card import DASHBOARD_CARD
     ctx.register_platform(
         name="max", label="MAX", adapter_factory=lambda cfg: MaxAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,
+        **DASHBOARD_CARD,
         required_env=["MAX_BOT_TOKEN"], install_hint="pip install httpx   # already a Hermes dependency",
         env_enablement_fn=_env_enablement,  # env-only setups show in `gateway status`
         cron_deliver_env_var="MAX_HOME_CHANNEL",
